@@ -89,6 +89,52 @@ describe("createTokenCounter", () => {
   });
 });
 
+describe("createTokenCounter long-run handling", () => {
+  // js-tiktoken is quadratic on a single unbroken run of one character
+  // class. Unbounded, each of these inputs blocks for seconds to minutes.
+  const cases: Array<[string, string, number, number]> = [
+    ["repeated letter", "x".repeat(500_000), 50_000, 130_000],
+    ["CJK without punctuation", "汉字测试文本".repeat(10_000), 40_000, 130_000],
+    ["whitespace padding", " ".repeat(200_000), 1, 60_000],
+    ["punctuation ruler", "=".repeat(200_000), 1, 60_000],
+  ];
+
+  for (const [label, text, minTokens, maxTokens] of cases) {
+    it(`counts a long ${label} run in bounded time`, () => {
+      const counter = createTokenCounter();
+      const startedAt = performance.now();
+      const tokens = counter.countTokens(text);
+      const elapsedMs = performance.now() - startedAt;
+
+      expect(elapsedMs).toBeLessThan(2_000);
+      expect(tokens).toBeGreaterThanOrEqual(minTokens);
+      expect(tokens).toBeLessThanOrEqual(maxTokens);
+    });
+  }
+
+  it("keeps exact counts for the text around a long run", () => {
+    const counter = createTokenCounter();
+    const prefix = "The quick brown fox jumps over the lazy dog. ";
+    const suffix = " And then it rested.";
+    const run = "x".repeat(4_000);
+
+    const combined = counter.countTokens(`${prefix}${run}${suffix}`);
+    const parts =
+      counter.countTokens(prefix) +
+      counter.countTokens(run) +
+      counter.countTokens(suffix);
+
+    expect(Math.abs(combined - parts)).toBeLessThanOrEqual(2);
+  });
+
+  it("leaves ordinary prose counts unchanged", () => {
+    const counter = createTokenCounter();
+    // 9 words + period = 10 tokens per sentence in cl100k_base.
+    const prose = "The quick brown fox jumps over the lazy dog. ".repeat(2_000);
+    expect(counter.countTokens(prose)).toBe(20_001);
+  });
+});
+
 describe("ContextManager.assembleContext", () => {
   it("assembleContext includes system prompt and never cuts it", () => {
     const manager = new ContextManager(fixedTokenCounter(10));

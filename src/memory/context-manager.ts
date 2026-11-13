@@ -128,6 +128,58 @@ function formatCacheKey(text: string, model?: string): string {
   return `${model ?? "default"}::${text}`;
 }
 
+/**
+ * js-tiktoken's BPE merge is quadratic in the length of a single
+ * pre-tokenized piece. Pieces are runs of one character class (letters,
+ * whitespace, or punctuation/symbols), so normal prose is fast, but a long
+ * unbroken run — CJK text without punctuation, "=====" rulers, padding,
+ * a repeated character — blocks the event loop for seconds to minutes
+ * (4k CJK chars ≈ 16s, 20k repeated letters ≈ 55s).
+ *
+ * Runs at or above this length are estimated from head/tail samples
+ * instead of being encoded in full, which keeps counting linear.
+ */
+const LONG_RUN_THRESHOLD = 96;
+const LONG_RUN_SAMPLE_CHARS = 48;
+const LONG_RUN_PATTERN = new RegExp(
+  `\\p{L}{${LONG_RUN_THRESHOLD},}|\\s{${LONG_RUN_THRESHOLD},}|[^\\s\\p{L}\\p{N}]{${LONG_RUN_THRESHOLD},}`,
+  "gu",
+);
+
+function estimateLongRunTokens(encoder: Tiktoken, run: string): number {
+  const head = run.slice(0, LONG_RUN_SAMPLE_CHARS);
+  const tail = run.slice(-LONG_RUN_SAMPLE_CHARS);
+  const headTokens = encoder.encode(head).length;
+  const tailTokens = tail === head ? headTokens : encoder.encode(tail).length;
+  const tokensPerChar = (headTokens + tailTokens) / (head.length + tail.length);
+  return Math.max(1, Math.ceil(tokensPerChar * run.length));
+}
+
+function countEncodedTokens(encoder: Tiktoken, text: string): number {
+  if (text.length < LONG_RUN_THRESHOLD) {
+    return encoder.encode(text).length;
+  }
+
+  let total = 0;
+  let cursor = 0;
+  for (const match of text.matchAll(LONG_RUN_PATTERN)) {
+    const start = match.index ?? 0;
+    if (start > cursor) {
+      total += encoder.encode(text.slice(cursor, start)).length;
+    }
+    total += estimateLongRunTokens(encoder, match[0]);
+    cursor = start + match[0].length;
+  }
+
+  if (cursor === 0) {
+    return encoder.encode(text).length;
+  }
+  if (cursor < text.length) {
+    total += encoder.encode(text.slice(cursor)).length;
+  }
+  return total;
+}
+
 export function createTokenCounter(): TokenCounter {
   const cache = new Map<string, number>();
   let encoder: Tiktoken | null = null;
@@ -152,7 +204,7 @@ export function createTokenCounter(): TokenCounter {
     let count: number;
     if (encoder) {
       try {
-        count = encoder.encode(normalizedText).length;
+        count = countEncodedTokens(encoder, normalizedText);
       } catch {
         count = Math.ceil(normalizedText.length / 3.5);
       }
